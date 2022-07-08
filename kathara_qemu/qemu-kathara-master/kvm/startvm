@@ -1,0 +1,156 @@
+#!/bin/bash
+
+set -x
+
+: ${LAUNCHER:='/usr/bin/qemu-system-x86_64'}
+# -virtfs local,path=/etc,mount_tag=host0,security_model=mapped,id=host0 -- Example of mounting a folder of the host as a VM volume
+# string for virtfs testing
+: ${KVM_SHR_OPTS:="-virtfs local,path=/shared,mount_tag=host0,security_model=mapped,id=virtfs0"}
+: ${KVM_HLAB_OPTS:="-virtfs local,path=/hostlab,mount_tag=host0,security_model=mapped,id=virtfs1"}
+#-----------------------------------------------------------------------------------------------------------------------------------
+: ${KVM_BLK_OPTS:="-drive if=virtio,file=/usr/local/image.qcow2"}
+: ${KVM_CPU_OPTS:="-m 1024 -smp 4,sockets=1,cores=1,threads=4"}
+#: ${KVM_CONNECT:="/start.sh"}
+: ${KVM_OPTS:="\
+  -nodefaults \
+  -device virtio-balloon-pci,id=balloon0 \
+  -overcommit mem-lock=off \
+  -msg timestamp=on \
+  -serial unix:/tmp/machine.sock,server,nowait \
+  -nographic
+  "}
+
+containsElement () {
+  local e
+  for e in "${@:2}"; do [[ "$e" == "$1" ]] && return 0; done
+  return 1
+}
+
+genMAC () {
+  hexchars="0123456789ABCDEF"
+  end=$( for i in {1..8} ; do echo -n ${hexchars:$(( $RANDOM % 16 )):1} ; done | sed -e 's/\(..\)/:\1/g' )
+  echo "FE:05$end"
+}
+
+generateNetdevNames () {
+  local netdevinterfaces=($(ip link show | awk "/macvtap/ { print \$2 }" | cut -d '@' -f 1 | tr -d :))
+  local randomID=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 6 | head -n 1)
+
+  # Check if the device already exists and regenerate the name if so
+  while containsElement "macvtap$randomID" "${netdevinterfaces[@]}"; do randomID=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 6 | head -n 1); done
+
+  echo "$randomID"
+}
+
+setupVtap () {
+  local iface="$1"
+  local deviceID=$(generateNetdevNames)
+
+  vtapdev="macvtap${deviceID}"
+  until $(ip link add link $iface name $vtapdev type macvtap mode bridge); do
+    sleep 1
+  done
+
+  ip link set $vtapdev address "$MAC"
+  ip link set $vtapdev up
+
+  # Create dev file (there is no udev in container: need to be done manually)
+  IFS=: read major minor < <(cat /sys/devices/virtual/net/$vtapdev/tap*/dev)
+  mknod "/dev/$vtapdev" c $major $minor
+
+  echo $deviceID
+}
+
+# Setup macvtap device to connect the VM with the container interfaces
+configureNetworks () {
+  # Select only eth or net interfaces (handled by Kathara)
+  local_ifaces=($(ip link show | awk '{print $2}' | tr -d : | sed 's/@.*$//' | grep "eth\|net"))
+  
+  local i=0
+
+  for iface in "${local_ifaces[@]}"; do
+    MAC=$(ip link show $iface | awk '/ether/ { print $2 }')
+
+    # Use container MAC address ($MAC) for tap device and generate a new one for the local interface
+    ip link set $iface down
+    ip link set $iface address $(genMAC)
+    ip link set $iface up
+
+    # Setup the macvtap devices for bridging the VM and the
+    deviceID=($(setupVtap $iface))
+
+    # Add Network parameters to KVM
+    let fd=$i+3
+    KVM_NET_OPTS="$KVM_NET_OPTS -netdev tap,id=net$i,vhost=on,fd=$fd ${fd}<>/dev/macvtap$deviceID"
+
+    KVM_NET_OPTS=" -device virtio-net-pci,netdev=net$i,mac=$MAC $KVM_NET_OPTS"
+    let i++
+  done
+
+  # Hack for guest VMs complaining about "bad udp checksums in 5 packets"
+  /usr/sbin/iptables -A POSTROUTING -t mangle -p udp --dport bootpc -j CHECKSUM --checksum-fill
+}
+
+# Replace real and insert scrips Linux init with a custom one.
+insertScripts () {
+  QCOW_FOLDER="/tmp/qcow"
+
+  # Mount the qcow image into a folder
+  mkdir $QCOW_FOLDER
+  guestmount -a /usr/local/image.qcow2 -i --rw $QCOW_FOLDER
+  _pid=$(pgrep guestmount)
+
+  #insert hostname
+
+  touch $QCOW_FOLDER/usr/local/hostname.txt
+  hostname=$(hostname)
+  echo $hostname > $QCOW_FOLDER/usr/local/hostname.txt
+  
+  # copy scripts for changing interface and startup into /usr/local
+
+  cp /tmp/startup.sh $QCOW_FOLDER/usr/local/
+  chmod +x $QCOW_FOLDER/usr/local/startup.sh
+
+  cp /tmp/changeInterface.sh $QCOW_FOLDER/usr/local/
+  chmod +x $QCOW_FOLDER/usr/local/changeInterface.sh
+
+  cp /tmp/setup.sh $QCOW_FOLDER/usr/local/
+  chmod +x $QCOW_FOLDER/usr/local/setup.sh
+
+  #insert startUp service
+  cp /tmp/startUp.service $QCOW_FOLDER/lib/systemd/system/
+  ln -s $QCOW_FOLDER/lib/systemd/system/startUp.service $QCOW_FOLDER/lib/systemd/system/multi-user.target.wants/
+
+  cp -p $QCOW_FOLDER/lib/systemd/system/startUp.service $QCOW_FOLDER/etc/systemd/system/
+  ln -s $QCOW_FOLDER/etc/systemd/system/startUp.service $QCOW_FOLDER/etc/systemd/system/multi-user.target.wants/
+  
+  # Remove original interfaces and replace with a custom one
+  rm -Rf $QCOW_FOLDER/etc/network/interfaces
+  cp /tmp/interfaces $QCOW_FOLDER/etc/network/
+  chmod +x $QCOW_FOLDER/etc/network/interfaces
+
+  # Kill and unmount the qcow
+  kill -9 $_pid
+  guestunmount $QCOW_FOLDER
+  rm -Rf $QCOW_FOLDER
+
+  # Wait for unmount the qcow
+  sleep 1
+}
+
+# Enable KVM support only if the host supports it
+if [[ $(grep -e vmx -e svm /proc/cpuinfo) ]]; then
+  KVM_OPTS="$KVM_OPTS -enable-kvm -machine accel=kvm,usb=off "
+else
+  KVM_OPTS="$KVM_OPTS -machine usb=off "
+fi
+
+  
+
+configureNetworks
+
+insertScripts
+
+eval exec $LAUNCHER $KVM_OPTS $KVM_BLK_OPTS $KVM_CPU_OPTS $KVM_NET_OPTS $KVM_SHR_OPTS $KVM_HLAB_OPTS #$KVM_CONNECT
+
+sleep infinity

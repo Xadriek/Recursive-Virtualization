@@ -1,0 +1,6 @@
+mkdir /shared
+mount -t 9p -o trans=virtio,version=9p2000.L host0 /shared
+mkdir /hostlab
+mount -t 9p -o trans=virtio,version=9p2000.L host0 /hostlab
+
+socat stdin,raw,echo=0,escape=0x11 UNIX:/tmp/machine.sock

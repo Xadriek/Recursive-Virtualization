@@ -1,0 +1,11 @@
+[Unit]
+ Description=StartUp Katharà
+ 
+ 
+[Service]
+ Type=simple
+ ExecStart=/usr/local/setup.sh
+
+ 
+[Install]
+ WantedBy=multi-user.target

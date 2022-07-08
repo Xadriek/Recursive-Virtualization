@@ -1,0 +1,15 @@
+auto lo
+iface lo inet loopback
+
+auto bond0
+
+iface bond0 inet static
+    address 192.168.1.1
+    netmask 255.255.255.0
+    network 192.168.1.0
+    bond-slaves eth0 eth1
+    bond-primary eth1
+    bond-mode 1
+    bond-miimon 100
+    bond-downdelay 200
+    bond-updelay 200

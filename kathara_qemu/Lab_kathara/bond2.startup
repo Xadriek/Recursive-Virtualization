@@ -1,0 +1,4 @@
+modprobe bonding
+echo 'bonding' >> /etc/modules
+systemctl restart networking
+
